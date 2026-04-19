@@ -1,13 +1,15 @@
-name: Daily Report New
+name: Daily Report New 2
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
   schedule:
-    - cron: "*/5 * * * * "
+    - cron: "7,17,27,37,47,57 * * * *"
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - run: echo "test"
-  
