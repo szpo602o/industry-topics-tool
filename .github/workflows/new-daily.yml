@@ -1,0 +1,13 @@
+name: Daily Report New
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * * "
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "test"
+  
