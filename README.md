@@ -1,21 +1,19 @@
 # industry-topics-tool
 
-GemMedの最新記事3件を取得し、HTMLダッシュボードをローカルに生成するツール。
+GemMedの最新記事3件を取得し、AIで要約したうえで **静的サイト `site/`** に日次 HTML を蓄積するツール。GitHub Actions で `site/` をコミットし Surge にデプロイしたあと、Slack に短い通知を送ります。
 
 ## ディレクトリ構成
 
 ```
 industry-topics-tool/
   src/
-    fetch/
-      list_pages.py      # GemMedトップからURL取得
-      article_pages.py   # 記事本文取得
-    render/
-      template.html      # Jinja2 HTMLテンプレート
-      render_html.py     # テンプレートにデータ差し込み → HTML出力
-    main.py              # 記事取得 → data/raw_articles_YYYYMMDD.json
-  data/                  # 中間JSONファイル（.gitignore対象）
-  output/                # 生成HTML（.gitignore対象）
+    fetch/           # GemMed スクレイプ
+    ai/              # 構造化（1記事1回の API）
+    render/          # Jinja2 テンプレート → site/
+    notify/          # Slack（post_slack は CI 用）
+  site/              # 生成 HTML（Git 管理。日付フォルダが増える）
+  data/              # 中間 JSON（.gitignore）
+  output/            # 旧ローカル検証用（.gitignore、未使用でも可）
   requirements.txt
   README.md
 ```
@@ -24,105 +22,85 @@ industry-topics-tool/
 
 ```bash
 cd industry-topics-tool
-
-# 仮想環境を作成・有効化（推奨）
 python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# Mac/Linux
-source .venv/bin/activate
-
-# 依存ライブラリをインストール
+# Windows: .venv\Scripts\activate
+source .venv/bin/activate   # Mac/Linux
 pip install -r requirements.txt
+Copy-Item .env.example .env   # PowerShell
+# .env に ANTHROPIC_API_KEY を設定。Slack まで試すなら SLACK_WEBHOOK_URL と PUBLIC_URL も。
 ```
 
-## ローカル実行手順
+## ローカル実行
 
-### Step A: 記事データを取得する
+```powershell
+# 取得 → AI → site/{YYYY-MM-DD}/index.html + site/index.html → Slack（PUBLIC_URL があるときのみ送信）
+python src/run_daily.py
 
-```bash
-python src/main.py
+python src/run_daily.py --date 20260411
+python src/run_daily.py --skip-fetch
+python src/run_daily.py --skip-fetch --skip-analyze
+# CI と同じく Slack を後回しにする
+python src/run_daily.py --skip-notify
 ```
 
-実行後、`data/raw_articles_YYYYMMDD.json` が生成される。
+個別ステップは従来どおり `src/ai/analyzer.py` や `src/render/render_html.py` でも実行可能です。
 
-### Step B: HTMLをダミーデータで確認する
+### HTML のみ確認（ダミーデータ）
 
 ```bash
 python src/render/render_html.py
 ```
 
-`output/index.html` が生成される。ブラウザで開いて表示を確認する。
-
-### Step C: AIで記事を構造化する
-
-事前に `.env` ファイルを作成してAPIキーを設定してください。
-
-```powershell
-# .env.example をコピーして .env を作成
-Copy-Item .env.example .env
-# .env を開いて ANTHROPIC_API_KEY を設定
-```
-
-```powershell
-python src/ai/analyzer.py
-```
-
-`data/structured_YYYYMMDD.json` が生成される。
-
-### Step D: 実データでHTMLを生成する
-
-```powershell
-python src/render/render_html.py --data data/structured_YYYYMMDD.json
-```
-
-### 出力ファイルを指定する場合
-
-```bash
-python src/render/render_html.py --out output/report_20260411.html
-```
-
-## 現在の実装状況（PoC）
-
-- [x] GemMedスクレイプ（URL取得・本文取得）
-- [x] raw JSON 保存
-- [x] HTMLテンプレート（Tailwind CDN、3段構成）
-- [x] ダミーデータでのHTML生成
-- [ ] AI要約・構造化（次のステップ）
-- [ ] Slack通知
-- [ ] GitHub Actions
-
-### 全自動実行（推奨）
-
-```powershell
-# 取得 → AI要約 → HTML生成 → Slack通知 を一括実行
-python src/run_daily.py
-
-# 日付指定
-python src/run_daily.py --date 20260411
-
-# 取得をスキップ（既存 raw JSON を使う）
-python src/run_daily.py --skip-fetch
-
-# AI要約もスキップ（既存 structured JSON を使う）
-python src/run_daily.py --skip-fetch --skip-analyze
-```
+`site/{今日の日付}/index.html` と `site/index.html` が生成されます。
 
 ## データフロー
 
 ```
-GemMedトップ
-  → src/fetch/list_pages.py    → URL × 3
-  → src/fetch/article_pages.py → data/raw_articles_YYYYMMDD.json
-  → src/ai/analyzer.py         → data/structured_YYYYMMDD.json
-  → src/render/render_html.py  → output/index.html
-  → src/notify/slack.py        → Slack 通知
+GemMed
+  → fetch → data/raw_articles_YYYYMMDD.json
+  → analyzer → data/structured_YYYYMMDD.json
+  → render → site/YYYY-MM-DD/index.html と site/index.html
+  → slack（ローカル） / post_slack.py（CI・Surge 後）
 ```
 
-## 環境変数一覧
+## GitHub Actions（`daily.yml`）
 
-| 変数名 | 必須 | 説明 |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | 必須 | AI要約に使用 |
-| `SLACK_WEBHOOK_URL` | 任意 | 未設定時は通知スキップ |
-| `PUBLIC_URL` | 任意 | 設定時はSlackにURLを通知。未設定時はローカルパス |
+このリポジトリがルートの場合、[.github/workflows/daily.yml](.github/workflows/daily.yml) が次の順で動きます。
+
+モノレポ（親リポジトリ `commit-report-tool`）で動かす場合は、親側の [.github/workflows/new-daily.yml](../../.github/workflows/new-daily.yml) を参照してください。
+
+1. `python src/run_daily.py --skip-notify`（`site/` 生成）
+2. `industry-topics-tool/site` を commit & push
+3. `npx surge ./industry-topics-tool/site <ドメイン> --token …` でデプロイ
+4. **`python src/notify/post_slack.py`** で Slack（**Surge 成功後**のみ送信）
+
+### Secrets（例）
+
+| Secret | 用途 |
+|--------|------|
+| `ANTHROPIC_API_KEY` | AI |
+| `SLACK_WEBHOOK_URL` | Slack Incoming Webhook |
+| `PUBLIC_URL` | 公開 URL のベース（末尾スラッシュなし）。**Actions 上では必須** |
+| `SURGE_TOKEN` | Surge [トークン](https://surge.sh/help/integrating-with-ci) |
+| `SURGE_DOMAIN` | 例: `medical-topics-ryo.surge.sh` |
+
+ブランチ保護で `github-actions[bot]` の push が拒否される場合は、ルールの例外設定が必要です。
+
+## 環境変数
+
+| 変数名 | ローカル | GitHub Actions |
+|--------|----------|----------------|
+| `ANTHROPIC_API_KEY` | 必須（AI 利用時） | 必須 |
+| `SLACK_WEBHOOK_URL` | 任意 | `post_slack` で必須 |
+| `PUBLIC_URL` | 任意（未設定なら Slack はスキップし警告） | **必須** |
+
+## 将来メモ（保存期間）
+
+現状は `site/` を Git にそのまま蓄積で問題ありません。日次 HTML が増えリポジトリが重くなった場合に備え、**直近 180 日や 365 日に保存期間を制限する**などの整理余地はあります（現時点では未実装）。
+
+## structured JSON の形（概要）
+
+各記事は API 1回で次のようなフィールドをまとめて返します（詳細は `src/ai/analyzer.py`）。
+
+- HTML 用: `points`（2件）, `implication`, `tags`（3件）
+- Slack 用: `slack_title`, `slack_note`

@@ -21,50 +21,42 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = ROOT / "data"
 
-# .env から ANTHROPIC_API_KEY を読み込む
 load_dotenv(ROOT / ".env")
 
-# トークン節約のため軽量モデルを使用
 MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 700  # 各記事1回あたりの上限（JSON出力に十分な量）
+MAX_TOKENS = 600
 
-# AI に渡す本文の最大文字数（raw取得時に800字で切っているが念のため再確認）
 BODY_MAX_CHARS = 700
 
 SYSTEM_PROMPT = """\
 あなたは医療政策の専門記者です。
-与えられた記事のタイトルと本文をもとに、以下のJSONを生成してください。
-他のテキストは一切出力せず、JSONのみ返してください。
+与えられた記事のタイトルと本文をもとに、次の1つのJSONオブジェクトだけを返してください。
+他のテキスト・説明・マークダウンは一切出力しないでください。
 
-出力スキーマ:
+【HTML表示用】
+- points: 文字列の配列で、要点はちょうど2つ。各文は60文字以内。長文要約・背景説明は禁止。
+- implication: 示唆を1文（「示唆：」のプレフィックスは付けない）。60文字以内。
+- points と implication を合わせた文字数は150文字以内を目安にする。
+- tags: キーワードをちょうど3つ。専門用語・固有名詞・テーマ語のみ（例：診療報酬改定、認知症治療病棟）。
+  一般語は避ける（記事・影響・対応・取り組み・強化・制度 など）。各3文字以上。
+
+【Slack通知用】（同じJSON内に含める）
+- slack_title: 1行目用の短い見出し（「1.」は付けない）。30文字以内を目安。
+- slack_note: 2行目用。先頭に「→」は付けない（アプリ側で付与）。30文字以内を目安。
+- slack_title と slack_note を合わせて、原則60文字以内。どうしても必要なら合計80文字以内。
+
+出力スキーマ（このキーだけ）:
 {
-  "summary": "記事の要約（2〜3文、100字以内）",
-  "points": ["要点1", "要点2", "要点3"],
-  "tags": ["タグ1", "タグ2", "タグ3"],
-  "business_impacts_our_company": ["当社への影響1", "当社への影響2", "当社への影響3"],
-  "business_impacts_customer": ["顧客（医療・福祉機関）への影響1", "影響2", "影響3"]
+  "points": ["要点1", "要点2"],
+  "implication": "示唆の一文",
+  "tags": ["キーワード1", "キーワード2", "キーワード3"],
+  "slack_title": "Slack1行目用",
+  "slack_note": "Slack2行目用"
 }
-
-タグのルール:
-- 最大3個
-- 専門用語・固有名詞・テーマ語のみ（例：診療報酬改定、認知症治療病棟、処遇改善加算）
-- 一般語は禁止（記事・影響・対応・取り組み・強化・制度・医療 など）
-- 3文字以上のみ
-- 他の記事と重複しないよう記事固有のキーワードを選ぶ
 """
 
 
 def analyze_article(client: anthropic.Anthropic, article: dict) -> dict:
-    """
-    1記事を1回のAI呼び出しで構造化する。
-
-    Args:
-        client: Anthropic クライアント
-        article: raw JSON の1記事（title, url, body を持つ dict）
-
-    Returns:
-        structured dict（title と url を保持し、AI出力フィールドを追加）
-    """
     title = article.get("title", "")
     body = article.get("body", "")[:BODY_MAX_CHARS]
 
@@ -85,7 +77,6 @@ def analyze_article(client: anthropic.Anthropic, article: dict) -> dict:
 
     raw_text = response.content[0].text.strip()
 
-    # JSONブロック（```json ... ```）が含まれる場合は中身だけ取り出す
     json_match = re.search(r"```(?:json)?\s*([\s\S]+?)\s*```", raw_text)
     if json_match:
         raw_text = json_match.group(1)
@@ -97,16 +88,25 @@ def analyze_article(client: anthropic.Anthropic, article: dict) -> dict:
         print(f"[analyzer] 生レスポンス: {raw_text[:200]}")
         return _fallback_result(article)
 
-    # 必要なキーが揃っているか確認し、不足はデフォルト値で補完
+    points = ai_data.get("points", [])
+    if not isinstance(points, list):
+        points = []
+    points = [str(p).strip() for p in points if str(p).strip()][:2]
+
+    tags = ai_data.get("tags", [])
+    if not isinstance(tags, list):
+        tags = []
+    tags = [str(t).strip() for t in tags if str(t).strip()][:3]
+
     result = {
         "title": title,
         "url": article.get("url", ""),
         "published_at": article.get("published_at", ""),
-        "summary": ai_data.get("summary", ""),
-        "points": ai_data.get("points", [])[:3],
-        "tags": ai_data.get("tags", [])[:3],
-        "business_impacts_our_company": ai_data.get("business_impacts_our_company", [])[:3],
-        "business_impacts_customer": ai_data.get("business_impacts_customer", [])[:3],
+        "points": points,
+        "implication": str(ai_data.get("implication", "")).strip(),
+        "tags": tags,
+        "slack_title": str(ai_data.get("slack_title", "")).strip(),
+        "slack_note": str(ai_data.get("slack_note", "")).strip(),
     }
 
     print(f"[analyzer]   tags: {result['tags']}")
@@ -114,29 +114,20 @@ def analyze_article(client: anthropic.Anthropic, article: dict) -> dict:
 
 
 def _fallback_result(article: dict) -> dict:
-    """AI呼び出し失敗時のフォールバック。空値で構造だけ揃える。"""
+    title = article.get("title", "") or ""
     return {
-        "title": article.get("title", ""),
+        "title": title,
         "url": article.get("url", ""),
         "published_at": article.get("published_at", ""),
-        "summary": "",
         "points": [],
+        "implication": "",
         "tags": [],
-        "business_impacts_our_company": [],
-        "business_impacts_customer": [],
+        "slack_title": title[:40] if title else "",
+        "slack_note": "",
     }
 
 
 def run(date_str: str) -> Path:
-    """
-    指定日付の raw JSON を読み込み、structured JSON を生成して返す。
-
-    Args:
-        date_str: "YYYYMMDD" 形式の文字列
-
-    Returns:
-        保存した structured JSON のパス
-    """
     raw_path = DATA_DIR / f"raw_articles_{date_str}.json"
     if not raw_path.exists():
         raise FileNotFoundError(f"raw JSON が見つかりません: {raw_path}")
@@ -167,7 +158,7 @@ def run(date_str: str) -> Path:
     out_path = DATA_DIR / f"structured_{date_str}.json"
     out_path.write_text(
         json.dumps(output, ensure_ascii=False, indent=2),
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
     print(f"\n[analyzer] ✓ structured JSON を保存しました: {out_path}")

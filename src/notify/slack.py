@@ -2,11 +2,12 @@
 Slack Webhook でレポート完了を通知する。
 
 環境変数:
-  SLACK_WEBHOOK_URL        必須: Incoming Webhook の URL
-  PUBLIC_URL               任意: 公開サイトのベースURL（末尾スラッシュなし推奨）
-                             当日ページは {PUBLIC_URL}/{YYYY-MM-DD}/ を組み立てる
-  SLACK_NOTIFY_TEXT_FIELD  任意: 各行の表示に使うフィールド（title または summary、既定: title）
+  SLACK_WEBHOOK_URL  必須（通知する場合）: Incoming Webhook の URL
+  PUBLIC_URL         本番・CIでは必須推奨: ベースURL（末尾スラッシュなし）
+                       ローカルでは未設定時は通知をスキップ（警告のみ）
 """
+
+from __future__ import annotations
 
 import os
 from pathlib import Path
@@ -14,88 +15,100 @@ from pathlib import Path
 import requests
 
 ROOT = Path(__file__).resolve().parent.parent.parent
-OUTPUT_DIR = ROOT / "output"
+SITE_DIR = ROOT / "site"
 
-# Slack 1行あたりの目安（全角含め文字数）
-_DEFAULT_MAX_LINE_CHARS = 56
+# 記事あたり: slack_title + slack_note の合計文字数目安・上限（全角=1）
+SLACK_CHAR_SOFT = 60
+SLACK_CHAR_HARD = 80
 
 
-def _truncate_line(text: str, max_chars: int = _DEFAULT_MAX_LINE_CHARS) -> str:
-    """長いタイトル・要約を1行向けに短縮する。"""
+def _truncate_run(text: str, max_chars: int) -> str:
     t = text.strip()
     if len(t) <= max_chars:
         return t
+    if max_chars <= 1:
+        return "…"
     return t[: max_chars - 1] + "…"
 
 
-def _notify_text_field() -> str:
-    """title または summary。不正値は title にフォールバック。"""
-    raw = os.environ.get("SLACK_NOTIFY_TEXT_FIELD", "title").strip().lower()
-    return raw if raw in ("title", "summary") else "title"
-
-
-def slack_line_for_article(article: dict, field: str | None = None) -> str:
+def _fit_slack_pair(title: str, note: str) -> tuple[str, str]:
     """
-    1記事分の通知用1行テキストを返す。
-    field が summary のとき空なら title にフォールバックする。
+    原則60字以内、最大80字まで。タイトル優先で短くし、足りなければ注釈を削る。
+    カウント: title + note（「→」は行に含めず、note 側のみ本文）。
     """
-    f = field or _notify_text_field()
-    if f == "summary":
-        s = (article.get("summary") or "").strip()
-        if not s:
-            s = (article.get("title") or "").strip()
-    else:
-        s = (article.get("title") or "").strip()
-    return _truncate_line(s)
+    t = title.strip()
+    n = note.strip()
+    # プレフィックス「1. 」「   → 」は build_slack_message 側。ここでは本文長のみ調整。
+    for _ in range(20):
+        combined = len(t) + len(n)
+        if combined <= SLACK_CHAR_SOFT:
+            return t, n
+        if combined <= SLACK_CHAR_HARD:
+            return t, n
+        if len(n) > 0:
+            n = _truncate_run(n, len(n) - 1)
+        elif len(t) > 0:
+            t = _truncate_run(t, len(t) - 1)
+        else:
+            break
+    return _truncate_run(t, 40), _truncate_run(n, 35)
 
 
 def build_daily_public_url(date_label: str) -> str:
-    """
-    当日固定版の公開URL（末尾スラッシュ付き）を返す。
-    PUBLIC_URL 未設定時はローカルの日付フォルダ index.html のパス（POSIX表記）。
-    """
     base = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
     if base:
         return f"{base}/{date_label}/"
-    local = OUTPUT_DIR / date_label / "index.html"
+    local = SITE_DIR / date_label / "index.html"
     return local.as_posix()
 
 
-def build_slack_message(structured: dict, date_label: str) -> str:
-    """
-    Slack 本文（プレーンテキスト）を組み立てる。
+def _slack_lines_for_article(article: dict, index: int) -> tuple[str, str]:
+    st = (article.get("slack_title") or "").strip()
+    sn = (article.get("slack_note") or "").strip()
+    if not st and not sn:
+        st = (article.get("title") or "").strip()
+        pts = article.get("points")
+        if isinstance(pts, list) and pts:
+            sn = str(pts[0]).strip()
+        elif article.get("summary"):
+            sn = str(article.get("summary", "")).strip()
+    st, sn = _fit_slack_pair(st, sn)
+    line1 = f"{index}. {st}" if st else f"{index}. （無題）"
+    line2 = f"   → {sn}" if sn else ""
+    return line1, line2
 
-    1行目: 本日の医療福祉業界トピックス（YYYY-MM-DD）
-    2〜4行目: 各記事（最大3件）の短い1行
-    最終行: 当日のURL
-    """
-    field = _notify_text_field()
+
+def build_slack_message(structured: dict, date_label: str) -> str:
     articles = structured.get("articles", [])[:3]
 
     lines: list[str] = [f"本日の医療福祉業界トピックス（{date_label}）"]
-    for a in articles:
-        lines.append(slack_line_for_article(a, field))
+    for i, a in enumerate(articles, 1):
+        l1, l2 = _slack_lines_for_article(a, i)
+        lines.append(l1)
+        if l2.strip():
+            lines.append(l2)
     lines.append(build_daily_public_url(date_label))
     return "\n".join(lines)
 
 
+def should_skip_slack_for_missing_public_url() -> bool:
+    """ローカル等: PUBLIC_URL が無ければ通知しない。"""
+    return not os.environ.get("PUBLIC_URL", "").strip()
+
+
 def notify(structured: dict, date_label: str) -> None:
-    """
-    Slack に通知を送る。本文は build_slack_message と同じ形式。
-
-    Args:
-        structured: structured JSON 相当の dict（articles を含む）
-        date_label: 日付（YYYY-MM-DD）。当日固定版URLのパスに使う。
-
-    Raises:
-        RuntimeError: SLACK_WEBHOOK_URL 未設定 or Slack API エラー時
-    """
     webhook_url = os.environ.get("SLACK_WEBHOOK_URL")
     if not webhook_url:
         raise RuntimeError(
             "SLACK_WEBHOOK_URL が設定されていません。"
             " .env に SLACK_WEBHOOK_URL=https://hooks.slack.com/... を追加してください。"
         )
+
+    if should_skip_slack_for_missing_public_url():
+        print(
+            "[slack] PUBLIC_URL が未設定のため通知をスキップします（本番・CI では PUBLIC_URL を設定してください）"
+        )
+        return
 
     message = build_slack_message(structured, date_label)
 
